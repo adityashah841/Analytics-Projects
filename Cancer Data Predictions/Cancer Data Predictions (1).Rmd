@@ -1,0 +1,488 @@
+---
+title: "Cancer Data Predictions"
+author: "Aditya Shah"
+date: "2025-04-29"
+output: word_document
+---
+
+```{r}
+library(tidyverse)
+library(GGally)
+library(ranger)
+library(data.table)
+library(ggplot2)
+library(randomForest)
+library(xgboost)
+library(Matrix)
+library(corrplot)
+library(dplyr)
+```
+
+```{r}
+df <- fread("global_cancer_patients_2015_2024.csv", na.strings = c("", "NA"))
+head(df)
+```
+
+```{r}
+cols_fact <- c("Gender","Country_Region","Cancer_Type","Cancer_Stage")
+df[ , (cols_fact) := lapply(.SD, factor), .SDcols = cols_fact]
+```
+
+```{r}
+summary(df)
+```
+
+```{r}
+num_cols <- setdiff(names(df)[sapply(df, is.numeric)],
+                    c("Patient_ID","Year",
+                      "Survival_Years","Target_Severity_Score","Treatment_Cost_USD"))
+for(col in num_cols){
+  med <- median(df[[col]], na.rm=TRUE)
+  df[is.na(get(col)), (col):=med]
+}
+for(col in cols_fact){
+  mode_val <- df[!is.na(get(col)), .N, by=col][order(-N)][1][[col]]
+  df[is.na(get(col)), (col):=mode_val]
+}
+```
+
+```{r}
+summary(df)
+```
+
+```{r}
+num_and_targets <- c(num_cols, 
+                     "Survival_Years","Target_Severity_Score","Treatment_Cost_USD")
+corrm <- cor(df[, ..num_and_targets])
+print(corrm)
+```
+
+```{r}
+set.seed(42)
+train_idx <- sample(seq_len(nrow(df)), size = 0.8*nrow(df))
+train <- df[train_idx]
+test  <- df[-train_idx]
+```
+
+```{r}
+corrplot(corrm,
+         method = "circle",
+         type = "full",
+         col = colorRampPalette(c("blue", "white", "red"))(100),
+         tl.col = "black",
+         tl.srt = 45,
+         addCoef.col = "black",
+         number.cex = 0.7,
+         diag = TRUE
+         )
+```
+
+```{r}
+prep_xy <- function(dat, outcome){
+  all_targets <- c("Survival_Years","Target_Severity_Score","Treatment_Cost_USD")
+  # drop ID, Year, plus whichever two targets we're not currently predicting:
+  drop_vars <- c("Patient_ID","Year", setdiff(all_targets, outcome))
+  
+  fmla <- as.formula(paste(outcome, "~ ."))
+  mm   <- sparse.model.matrix(
+             fmla,
+             data = dat[, !..drop_vars, with=FALSE]
+           )
+  y    <- dat[[outcome]]
+  list(X = mm, y = y)
+}
+
+rmse <- function(truth, pred) sqrt(mean((pred-truth)^2))
+r2   <- function(truth, pred) cor(truth, pred)^2
+```
+
+```{r}
+run_models <- function(train, test, outcome){
+  # prep
+  tr <- prep_xy(train, outcome)
+  te <- prep_xy(test,  outcome)
+  
+  results <- list()
+  
+  # 7a) Linear regression (via lm)
+  lm_dat <- as.data.frame(cbind(y = tr$y, as.matrix(tr$X)))
+  lm_fit <- lm(y ~ . -1, data = lm_dat)        # "-1" since X already has dummies intercept removed
+  lm_pred <- predict(lm_fit, newdata = as.data.frame(as.matrix(te$X)))
+  results$lm <- list(
+    model = lm_fit,
+    rmse  = rmse(te$y, lm_pred),
+    r2    = r2(te$y,    lm_pred)
+  )
+  
+  # 7b) Random forest (tune mtry via tuneRF)
+  # first find good mtry on train:
+  set.seed(42)
+  rf_try <- tuneRF(
+    x        = as.matrix(tr$X),
+    y        = tr$y,
+    ntreeTry = 500,
+    stepFactor = 1.5,
+    improve    = 0.01,
+    trace      = FALSE
+  )
+  best_mtry <- rf_try[which.min(rf_try[, "OOBError"]), "mtry"]
+  rf_fit <- randomForest(
+    x      = as.matrix(tr$X),
+    y      = tr$y,
+    ntree  = 1000,
+    mtry   = best_mtry,
+    nodesize = 5
+  )
+  rf_pred <- predict(rf_fit, newdata = as.matrix(te$X))
+  results$rf <- list(
+    model = rf_fit,
+    rmse  = rmse(te$y, rf_pred),
+    r2    = r2(te$y, rf_pred)
+  )
+  
+  # 7c) XGBoost (grid-search max_depth & eta via simple loop)
+  dtrain <- xgb.DMatrix(data = tr$X, label = tr$y)
+  watchlist <- list(train = dtrain)
+  best_score <- Inf
+  best_params <- list()
+  for(max_depth in c(3,6,9)){
+    for(eta in c(0.01,0.1,0.3)){
+      params <- list(
+        objective   = "reg:squarederror",
+        max_depth   = max_depth,
+        eta         = eta,
+        subsample   = 0.8,
+        colsample_bytree = 0.8
+      )
+      cv <- xgb.cv(
+        params        = params,
+        data          = dtrain,
+        nrounds       = 500,
+        nfold         = 5,
+        early_stopping_rounds = 10,
+        verbose       = FALSE,
+        metrics       = "rmse"
+      )
+      mean_rmse <- min(cv$evaluation_log$test_rmse_mean)
+      if(mean_rmse < best_score){
+        best_score  <- mean_rmse
+        best_params <- params
+        best_nrounds <- cv$best_iteration
+      }
+    }
+  }
+  xgb_fit <- xgb.train(
+    params    = best_params,
+    data      = dtrain,
+    nrounds   = best_nrounds,
+    verbose   = FALSE
+  )
+  xgb_pred <- predict(xgb_fit, newdata = te$X)
+  results$xgb <- list(
+    model = xgb_fit,
+    rmse  = rmse(te$y, xgb_pred),
+    r2    = r2(te$y, xgb_pred)
+  )
+  
+  return(results)
+}
+```
+
+```{r}
+targets <- c("Survival_Years","Target_Severity_Score","Treatment_Cost_USD")
+all_results <- lapply(targets, function(tgt){
+  cat(">>> Modeling", tgt, "...\n")
+  res <- run_models(train, test, tgt)
+  cat(sprintf("  LM   — RMSE: %.3f  R²: %.3f\n", res$lm$rmse, res$lm$r2))
+  cat(sprintf("  RF   — RMSE: %.3f  R²: %.3f\n", res$rf$rmse, res$rf$r2))
+  cat(sprintf("  XGB  — RMSE: %.3f  R²: %.3f\n\n",res$xgb$rmse,res$xgb$r2))
+  return(res)
+})
+names(all_results) <- targets
+```
+
+```{r}
+varImpPlot(all_results[["Survival_Years"]]$rf$model, main="RF Variable Importance\nfor Survival_Years")
+```
+
+```{r}
+if(!require(gridExtra)) install.packages("gridExtra"); library(gridExtra)
+library(ggplot2)
+```
+
+```{r}
+get_residuals <- function(model, type, target) {
+  # type ∈ c("lm","rf","xgb"); target is column name
+  actual <- test[[target]]
+  if(type == "lm") {
+    # rebuild test X-frame for lm (as in your existing code)
+    X_test  <- as.data.frame(as.matrix(prep_xy(test, target)$X))
+    pred    <- predict(model, newdata = X_test)
+    # also need leverage / std residuals for lm
+    lev     <- hatvalues(model)
+    stdres  <- rstandard(model)
+    list(pred = pred, resid = actual - pred,
+         leverage = lev, stdres = stdres)
+  }
+  else if(type == "rf") {
+    X_test <- as.matrix(prep_xy(test, target)$X)
+    pred   <- predict(model, newdata = X_test)
+    list(pred = pred, resid = actual - pred)
+  }
+  else if(type == "xgb") {
+    # model is an xgb.Booster
+    dtest  <- xgb.DMatrix(data = prep_xy(test, target)$X)
+    pred   <- predict(model, newdata = dtest)
+    list(pred = pred, resid = actual - pred)
+  }
+}
+```
+
+```{r}
+for(tgt in targets){
+  cat("=== Diagnostics for", tgt, "===\n")
+  
+  # 1) Linear model diagnostics (4 plots)
+  lr <- all_results[[tgt]]$lm$model
+  res_lm <- get_residuals(lr, "lm", tgt)
+  # 1a) Residuals vs Fitted
+  p1 <- ggplot(data.frame(Fitted = res_lm$pred, Residuals = res_lm$resid),
+               aes(Fitted, Residuals)) +
+    geom_point(alpha = 0.6) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    labs(title = paste(tgt, "- LM: Residuals vs Fitted"))
+  # 1b) Normal Q–Q
+  p2 <- ggplot(data.frame(StdRes = res_lm$stdres), aes(sample = StdRes)) +
+    stat_qq() + stat_qq_line() +
+    labs(title = paste(tgt, "- LM: Q–Q Plot"))
+  # 1c) Scale–Location
+  p3 <- ggplot(data.frame(Fitted = res_lm$pred,
+                          ScaleLoc = sqrt(abs(res_lm$resid))),
+               aes(Fitted, ScaleLoc)) +
+    geom_point(alpha = 0.6) +
+    geom_smooth(se = FALSE) +
+    labs(title = paste(tgt, "- LM: Scale–Location"))
+  # 1d) Residuals vs Leverage
+  p4 <- ggplot(data.frame(Leverage = res_lm$leverage,
+                          StdRes   = res_lm$stdres),
+               aes(Leverage, StdRes)) +
+    geom_point(alpha = 0.6) +
+    geom_smooth(se = FALSE) +
+    labs(title = paste(tgt, "- LM: Residuals vs Leverage"))
+  
+  grid.arrange(p1, p2, p3, p4, ncol = 2)
+  
+  
+  # 2) Random Forest diagnostics (resid vs fitted + Q–Q)
+  rf <- all_results[[tgt]]$rf$model
+  res_rf <- get_residuals(rf, "rf", tgt)
+  p_rf1 <- ggplot(data.frame(Fitted = res_rf$pred, Residuals = res_rf$resid),
+                  aes(Fitted, Residuals)) +
+    geom_point(alpha = 0.6) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    labs(title = paste(tgt, "- RF: Residuals vs Fitted"))
+  p_rf2 <- ggplot(data.frame(Residuals = res_rf$resid), aes(sample = Residuals)) +
+    stat_qq() + stat_qq_line() +
+    labs(title = paste(tgt, "- RF: Q–Q Plot"))
+  
+  grid.arrange(p_rf1, p_rf2, ncol = 2)
+  
+  
+  # 3) XGBoost diagnostics (resid vs fitted + Q–Q)
+  xgbm <- all_results[[tgt]]$xgb$model
+  res_xgb <- get_residuals(xgbm, "xgb", tgt)
+  p_x1 <- ggplot(data.frame(Fitted = res_xgb$pred, Residuals = res_xgb$resid),
+                 aes(Fitted, Residuals)) +
+    geom_point(alpha = 0.6) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    labs(title = paste(tgt, "- XGB: Residuals vs Fitted"))
+  p_x2 <- ggplot(data.frame(Residuals = res_xgb$resid), aes(sample = Residuals)) +
+    stat_qq() + stat_qq_line() +
+    labs(title = paste(tgt, "- XGB: Q–Q Plot"))
+  
+  grid.arrange(p_x1, p_x2, ncol = 2)
+  
+  cat("\n")
+}
+```
+
+```{r}
+lm_sev  <- all_results[["Target_Severity_Score"]]$lm$model
+rf_sev  <- all_results[["Target_Severity_Score"]]$rf$model
+xgb_sev <- all_results[["Target_Severity_Score"]]$xgb$model
+```
+
+```{r}
+cat("=== Linear Model Summary ===\n")
+print(summary(lm_sev))            # full summary: R², F-stat, etc.
+cat("\n=== Coefficients ===\n")
+print(coef(lm_sev))               # beta_j for each predictor
+```
+
+```{r}
+cat("\n=== Random Forest ===\n")
+print(rf_sev)                     # shows ntree, mtry, nodesize
+cat("\n=== RF Variable Importance (Top 10) ===\n")
+imp_rf <- importance(rf_sev)
+print(head(imp_rf[order(imp_rf[,1], decreasing=TRUE), ], 10))
+# optional plot
+varImpPlot(rf_sev, n.var = 10, main = "RF: Top 10 Variable Importances")
+```
+
+```{r}
+cat("\n=== XGBoost Model Details ===\n")
+# xgb.Booster objects print their parameters if you just print():
+print(xgb_sev)
+```
+
+```{r}
+library(xgboost)
+feat_names <- colnames(prep_xy(train, "Target_Severity_Score")$X)
+imp_xgb <- xgb.importance(feature_names = feat_names, model = xgb_sev)
+cat("\n=== XGB Feature Importance (Top 10) ===\n")
+print(head(imp_xgb, 10))
+# optional plot
+xgb.plot.importance(imp_xgb[1:10, ], main = "XGB: Top 10 Feature Importances")
+```
+
+```{r}
+cat("\n=== First Tree Structure ===\n")
+first_tree <- xgb.dump(xgb_sev, with_stats = TRUE)[[1]]
+cat(first_tree, sep = "\n")
+```
+```{r}
+# ─── 1) Simplified linear model with the top 5 predictors ───────────────────────
+top5 <- c("Smoking",
+          "Genetic_Risk",
+          "Air_Pollution",
+          "Alcohol_Use",
+          "Obesity_Level")
+
+# Fit on train
+lm_simple <- lm(
+  Target_Severity_Score ~ Smoking + Genetic_Risk + Air_Pollution + Alcohol_Use + Obesity_Level,
+  data = train
+)
+
+# Summarize
+cat("=== Simple LM (top 5) Summary ===\n")
+print(summary(lm_simple)$coefficients)
+
+# Evaluate on test
+pred_simple <- predict(lm_simple, newdata = test)
+cat("Simple LM — RMSE:",    rmse(test$Target_Severity_Score, pred_simple), 
+    "  R²:", r2(test$Target_Severity_Score, pred_simple), "\n\n")
+
+
+# ─── 2) (Optional) LASSO for automated feature selection ───────────────────────
+if(!require(glmnet)) install.packages("glmnet"); library(glmnet)
+
+# Build sparse matrix
+X_tr <- prep_xy(train, "Target_Severity_Score")$X
+y_tr <- train$Target_Severity_Score
+
+# 5-fold CV LASSO
+cv_las <- cv.glmnet(X_tr, y_tr, alpha = 1, nfolds = 5)
+cat("λ_min:", cv_las$lambda.min, "  λ_1se:", cv_las$lambda.1se, "\n")
+
+# Coefs at λ_1se (more sparse)
+coefs <- coef(cv_las, s = "lambda.1se")
+cat("=== Nonzero LASSO Coefficients (λ_1se) ===\n")
+print(coefs[which(coefs != 0), , drop=FALSE])
+
+# Test performance
+X_te <- prep_xy(test, "Target_Severity_Score")$X
+pred_lasso <- predict(cv_las, newx = X_te, s = "lambda.1se")
+cat("LASSO — RMSE:", rmse(test$Target_Severity_Score, pred_lasso), 
+    "  R²:", r2(test$Target_Severity_Score, pred_lasso), "\n")
+```
+```{r}
+library(car)
+vif(lm_simple)
+```
+```{r}
+set.seed(123)
+library(boot)
+# function to return coefficients
+boot_fn <- function(data, idx) {
+  coef(lm(Target_Severity_Score ~ Smoking + Genetic_Risk + Air_Pollution +
+                                 Alcohol_Use + Obesity_Level,
+          data = data[idx, ]))
+}
+boot_res <- boot(train, boot_fn, R = 200)
+boot_res
+```
+
+Conclusion for Survival Years and Treatment Cost in USD predictions for a cancer patient: We have discovered that with only demographic and lifestyle / genetic features, we cannot predict how long a cancer patient will survive or the cost of the treatment. We will need more granular clinical data or a survival analysis to obtain a prediction for the survival years analysis.
+
+
+1. Model Development & Selection
+
+Candidates Tested: Ordinary Least Squares (OLS), Random Forest, and XGBoost on a train/test split.
+
+Feature Set: All 29 original predictors (age, gender, region, cancer type & stage, plus the five continuous risk scores).
+
+Leakage Eliminated: Other outcome variables (Survival_Years, Treatment_Cost_USD) were dropped from the feature set before fitting.
+
+
+
+2. Performance
+
+Model	Test-set RMSE	Test-set R²
+Full OLS (29 vars)	0.547	0.797
+Random Forest	0.566	0.785
+XGBoost	0.553	0.793
+Simple OLS (5 vars)	0.547	0.797
+
+Key point: A pared-down OLS model using only Smoking, Genetic_Risk, Air_Pollution, Alcohol_Use, and Obesity_Level matches or slightly outperforms the more complex learners, with an RMSE of ~0.547 and R² ≈ 0.80.
+
+
+
+3. Final Parsimonious Model
+
+Severity ≈ 0.941  
+         + 0.201·Smoking  
+         + 0.200·Genetic_Risk  
+         + 0.152·Air_Pollution  
+         + 0.150·Alcohol_Use  
+         + 0.100·Obesity_Level
+         
+Intercept (0.94): Baseline severity when all risk scores are zero.
+
+Coefficients: All five predictors are highly significant (p < 0.001) and positive, indicating a direct, additive relationship to severity.
+
+
+4. Diagnostic & Stability Checks
+Residual Analysis
+
+Residuals vs. Fitted: Flat, homoscedastic band → no unmodeled non-linearity or heteroscedasticity.
+
+Q–Q Plot: Points lie almost exactly on the line → residuals are approximately Gaussian.
+
+Multicollinearity
+
+VIFs all ≈ 1.00 → predictors are essentially orthogonal; no redundant information.
+
+Bootstrap (200 replicates)
+
+Bias < |0.001|, Std. errors ≈ 0.001 for all coefficients → extremely stable estimates across resamples.
+
+
+
+5. Interpretation & Implications
+Smoking and Genetic Risk exert the largest individual effects (≈ 0.20 increase per unit).
+
+Air Pollution and Alcohol Use follow closely (≈ 0.15).
+
+Obesity Level contributes moderately (≈ 0.10).
+
+Cancer-specific features (type, stage) and demographics (age, gender, region) added no predictive value once these five risk scores were in the model.
+
+
+Implication: Severity in this dataset is driven almost entirely by these five continuous risk measures. A simple linear rule suffices to capture 80% of the variation—no black-box model is needed.
+
+
+
+
+6. Conclusion:
+With just five well-measured risk factors and a straightforward linear equation, we can robustly predict a patient’s severity score—achieving the same accuracy as far more complex algorithms, with crystal-clear interpretability and stability.
