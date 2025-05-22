@@ -52,7 +52,7 @@ This will
 - Conduct PCA, event study, forecasting, risk modeling
 - Generate simulation results & comparison charts
 
-## 📑 Scripts Overview
+## 📑 Code Walkthrough
 The provided R-markdown script follows the following outline
 - Data Ingestion & Preparation
   - Load raw CSV of daily OHLCV data (2010–2025)
